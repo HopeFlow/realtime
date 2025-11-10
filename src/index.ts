@@ -75,7 +75,6 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 		this.ctx.acceptWebSocket(server, [tag]);
 
 		server.serializeAttachment({ userId });
-		server.accept();
 
 		return new Response(null, { status: 101, webSocket: client });
 	}
@@ -101,7 +100,6 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 		let delivered = 0;
 		for (const socket of sockets) {
 			try {
-				socket.accept();
 				socket.send(serialized);
 				delivered += 1;
 			} catch (error) {
@@ -123,8 +121,6 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 			ws.close(1008, 'missing session');
 			return;
 		}
-		ws.accept();
-
 		if (typeof message === 'string') {
 			const trimmed = message.trim().toLowerCase();
 			if (trimmed === 'ping') ws.send('pong');
@@ -132,7 +128,6 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 	}
 
 	webSocketClose(ws: WebSocket, code: number): void {
-		ws.accept();
 		const ctx = this.getConnectionContext(ws);
 		if (!ctx) return;
 		if (code !== 1000) {
