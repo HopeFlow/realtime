@@ -190,7 +190,11 @@ export default {
 
     // WebSocket upgrade → authenticate here, then forward to the user's DO
     if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-      const auth = await authenticate(request.headers.get('Authorization'), env.JWT_SECRET);
+      const auth = await authenticate(
+        request.headers.get('Authorization'),
+        env.JWT_SECRET,
+        url.searchParams.get('token'),
+      );
       if (!auth) return new Response('Unauthorized', { status: 401 });
 
       const userId = auth.userId.trim();
@@ -205,7 +209,11 @@ export default {
 
     // Process publish entirely here; send canonical envelope to the user's DO
     if (method === 'POST' && url.pathname === '/publish') {
-      const auth = await authenticate(request.headers.get('Authorization'), env.JWT_SECRET);
+      const auth = await authenticate(
+        request.headers.get('Authorization'),
+        env.JWT_SECRET,
+        url.searchParams.get('token'),
+      );
       if (!auth) return json({ error: 'Unauthorized' }, 401);
 
       const contentType = request.headers.get('content-type') ?? '';
@@ -264,8 +272,12 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-async function authenticate(header: string | null, secret: string): Promise<AuthPayload | null> {
-  const token = extractToken(header);
+async function authenticate(
+  header: string | null,
+  secret: string,
+  queryToken?: string | null,
+): Promise<AuthPayload | null> {
+  const token = extractToken(header) ?? sanitizeQueryToken(queryToken);
   if (!token) return null;
   try {
     const key = encoder.encode(secret);
@@ -287,6 +299,12 @@ function extractToken(header: string | null): string | null {
     return bearer.length > 0 ? bearer : null;
   }
   return trimmed;
+}
+
+function sanitizeQueryToken(token: string | null | undefined): string | null {
+  if (!token) return null;
+  const trimmed = token.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 // Clone a Request, optionally change path, and add a header
