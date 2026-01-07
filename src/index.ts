@@ -112,7 +112,9 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 		this.ctx.setHibernatableWebSocketEventTimeout(HIBERNATION_TIMEOUT_MS);
 		this.ctx.acceptWebSocket(server, [tag]);
 
-		server.serializeAttachment({ userId });
+		// Assign a unique connection ID to the attachment
+		const connectionId = crypto.randomUUID();
+		server.serializeAttachment({ userId, connectionId });
 
 		return new Response(null, { status: 101, webSocket: client });
 	}
@@ -141,6 +143,7 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 		const targets: WebSocket[] = [];
 
 		for (const socket of sockets) {
+			await this.restoreSubscriptionsIfMissing(socket);
 			if (this.shouldDeliver(socket, envelope)) {
 				targets.push(socket);
 			}
@@ -171,7 +174,7 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 		return this.json({ clientCount: targets.length, results });
 	}
 
-	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+	async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
 		const ctx = this.getConnectionContext(ws);
 		if (!ctx) {
 			ws.close(1008, 'missing session');
@@ -196,17 +199,21 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 			if (typed.type === 'ack') {
 				this.handleAck(ws, parsed as AckMessage);
 			} else if (typed.type === 'subscribe') {
-				this.handleSubscribe(ws, parsed as SubscribeMessage);
+				await this.handleSubscribe(ws, parsed as SubscribeMessage);
 			} else if (typed.type === 'unsubscribe') {
-				this.handleUnsubscribe(ws, parsed as UnsubscribeMessage);
+				await this.handleUnsubscribe(ws, parsed as UnsubscribeMessage);
 			}
 		}
 	}
 
-	webSocketClose(ws: WebSocket, code: number): void {
+	async webSocketClose(ws: WebSocket, code: number): Promise<void> {
 		const ctx = this.getConnectionContext(ws);
 		if (!ctx) return;
 		this.subscriptions.delete(ws);
+		// Cleanup storage
+		if (ctx.connectionId) {
+			await this.ctx.storage.delete(`sub:${ctx.connectionId}`);
+		}
 		for (const [envelopeId, entry] of this.pendingAcks.entries()) {
 			if (entry.pending.delete(ws) && entry.pending.size === 0) {
 				this.finishPending(envelopeId, entry);
@@ -217,10 +224,10 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 		}
 	}
 
-	private getConnectionContext(ws: WebSocket): { userId: string } | null {
+	private getConnectionContext(ws: WebSocket): { userId: string; connectionId?: string } | null {
 		const attachment = ws.deserializeAttachment();
 		if (attachment && typeof (attachment as { userId?: unknown }).userId === 'string') {
-			return attachment as { userId: string };
+			return attachment as { userId: string; connectionId?: string };
 		}
 		return null;
 	}
@@ -309,7 +316,7 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 		}
 	}
 
-	private handleSubscribe(ws: WebSocket, msg: SubscribeMessage): void {
+	private async handleSubscribe(ws: WebSocket, msg: SubscribeMessage): Promise<void> {
 		const incoming = this.normalizeFilters(msg.filters);
 		if (incoming.length === 0) return;
 		const existing = this.subscriptions.get(ws) ?? [];
@@ -320,14 +327,32 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 			}
 		}
 		this.subscriptions.set(ws, merged);
+		await this.persistSubscriptions(ws, merged);
 	}
 
-	private handleUnsubscribe(ws: WebSocket, msg: UnsubscribeMessage): void {
+	private async handleUnsubscribe(ws: WebSocket, msg: UnsubscribeMessage): Promise<void> {
 		const toRemove = this.normalizeFilters(msg.filters);
 		if (toRemove.length === 0) return;
 		const existing = this.subscriptions.get(ws) ?? [];
 		const remaining = existing.filter((f) => !toRemove.some((r) => this.filtersEqual(f, r)));
 		this.subscriptions.set(ws, remaining);
+		await this.persistSubscriptions(ws, remaining);
+	}
+
+	private async persistSubscriptions(ws: WebSocket, filters: SubscriptionFilter[]): Promise<void> {
+		const ctx = this.getConnectionContext(ws);
+		if (ctx?.connectionId) {
+			await this.ctx.storage.put(`sub:${ctx.connectionId}`, filters);
+		}
+	}
+
+	private async restoreSubscriptionsIfMissing(ws: WebSocket): Promise<void> {
+		if (this.subscriptions.has(ws)) return;
+		const ctx = this.getConnectionContext(ws);
+		if (ctx?.connectionId) {
+			const filters = (await this.ctx.storage.get<SubscriptionFilter[]>(`sub:${ctx.connectionId}`)) ?? [];
+			this.subscriptions.set(ws, filters);
+		}
 	}
 
 	private normalizeFilters(raw: unknown): SubscriptionFilter[] {
