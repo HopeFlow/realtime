@@ -15,10 +15,32 @@ type PublishInput = {
 };
 
 type RealtimeEnvelope = {
+	envelopeId: string;
 	type: string;
 	userId: string;
 	timestamp: string;
 	payload?: unknown;
+};
+
+type SubscriptionFilter = {
+	type: string;
+	[key: string]: string;
+};
+
+type AckMessage = {
+	type: 'ack';
+	envelopeId: string;
+	result?: unknown;
+};
+
+type SubscribeMessage = {
+	type: 'subscribe';
+	filters: SubscriptionFilter[];
+};
+
+type UnsubscribeMessage = {
+	type: 'unsubscribe';
+	filters: SubscriptionFilter[];
 };
 
 const JSON_HEADERS = {
@@ -30,16 +52,33 @@ const JSON_HEADERS = {
 
 const encoder = new TextEncoder();
 const HIBERNATION_TIMEOUT_MS = 60 * 60 * 1000;
+const ACK_TIMEOUT_MS = 5000;
 
 /* -------------------------- Durable Object (per user) -------------------------- */
 
 export class HopeFlowRealtime extends DurableObject<Env> {
+	private readonly subscriptions = new Map<WebSocket, SubscriptionFilter[]>();
+	private readonly pendingAcks = new Map<
+		string,
+		{
+			pending: Set<WebSocket>;
+			results: unknown[];
+			resolve: (results: unknown[]) => void;
+			timeout: number;
+		}
+	>();
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 	}
 
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
+		const userId = (request.headers.get('x-user-id') || '').trim();
+		if (!userId) {
+			console.warn('request missing x-user-id header');
+			return new Response('Unauthorized', { status: 401 });
+		}
 
 		// Outer worker already authenticated and sharded to the correct DO.
 		// We only handle:
@@ -62,7 +101,6 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 
 	private async handleConnect(request: Request): Promise<Response> {
 		const userId = (request.headers.get('x-user-id') || '').trim();
-		if (!userId) return new Response('Unauthorized', { status: 401 });
 
 		const pair = new WebSocketPair();
 		const client = pair[0];
@@ -88,22 +126,39 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 
 		let envelope: RealtimeEnvelope;
 		try {
-			envelope = (await request.json()) as RealtimeEnvelope;
+			const parsed = (await request.json()) as unknown;
+			const normalized = this.normalizeEnvelope(parsed);
+			if (!normalized) return this.json({ error: 'Invalid envelope' }, 400);
+			envelope = normalized;
+			if (!envelope.envelopeId) {
+				envelope.envelopeId = generateEnvelopeId();
+			}
 		} catch {
 			return this.json({ error: 'Invalid JSON body' }, 400);
 		}
 
-		// Fan-out to all sockets in this DO (all belong to the same user).
-		const serialized = JSON.stringify(envelope);
-		const sockets = this.ctx.getWebSockets(); // no tag needed with per-user DO
+		const sockets = this.ctx.getWebSockets();
+		const targets: WebSocket[] = [];
 
-		let delivered = 0;
 		for (const socket of sockets) {
+			if (this.shouldDeliver(socket, envelope)) {
+				targets.push(socket);
+			}
+		}
+
+		if (targets.length === 0) {
+			return this.json({ clientCount: 0, results: [] });
+		}
+
+		const serialized = JSON.stringify(envelope);
+		const ackPromise = this.awaitAcks(envelope.envelopeId, targets);
+
+		for (const socket of targets) {
 			try {
 				socket.send(serialized);
-				delivered += 1;
 			} catch (error) {
 				console.error('failed to deliver realtime message', { error });
+				this.removeFromPending(envelope.envelopeId, socket);
 				try {
 					socket.close(1011, 'delivery failure');
 				} catch (closeError) {
@@ -112,7 +167,8 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 			}
 		}
 
-		return this.json({ delivered, attempted: sockets.length });
+		const results = await ackPromise;
+		return this.json({ clientCount: targets.length, results });
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
@@ -123,13 +179,39 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 		}
 		if (typeof message === 'string') {
 			const trimmed = message.trim().toLowerCase();
-			if (trimmed === 'ping') ws.send('pong');
+			if (trimmed === 'ping') {
+				ws.send('pong');
+				return;
+			}
+
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(message);
+			} catch {
+				return;
+			}
+
+			if (!parsed || typeof parsed !== 'object') return;
+			const typed = parsed as { type?: unknown };
+			if (typed.type === 'ack') {
+				this.handleAck(ws, parsed as AckMessage);
+			} else if (typed.type === 'subscribe') {
+				this.handleSubscribe(ws, parsed as SubscribeMessage);
+			} else if (typed.type === 'unsubscribe') {
+				this.handleUnsubscribe(ws, parsed as UnsubscribeMessage);
+			}
 		}
 	}
 
 	webSocketClose(ws: WebSocket, code: number): void {
 		const ctx = this.getConnectionContext(ws);
 		if (!ctx) return;
+		this.subscriptions.delete(ws);
+		for (const [envelopeId, entry] of this.pendingAcks.entries()) {
+			if (entry.pending.delete(ws) && entry.pending.size === 0) {
+				this.finishPending(envelopeId, entry);
+			}
+		}
 		if (code !== 1000) {
 			console.warn('websocket closed abnormally', { userId: ctx.userId, code });
 		}
@@ -141,6 +223,146 @@ export class HopeFlowRealtime extends DurableObject<Env> {
 			return attachment as { userId: string };
 		}
 		return null;
+	}
+
+	private shouldDeliver(socket: WebSocket, envelope: RealtimeEnvelope): boolean {
+		const filters = this.subscriptions.get(socket);
+		if (!filters || filters.length === 0) return false;
+		return filters.some((filter) => this.matchesEnvelope(filter, envelope));
+	}
+
+	private matchesEnvelope(filter: SubscriptionFilter, envelope: RealtimeEnvelope): boolean {
+		if (filter.type !== envelope.type) return false;
+		const payload = envelope.payload;
+		if (Object.keys(filter).length === 1) return true;
+		if (!payload || typeof payload !== 'object') return false;
+		const payloadObj = payload as Record<string, unknown>;
+		for (const [key, value] of Object.entries(filter)) {
+			if (key === 'type') continue;
+			if (payloadObj[key] !== value) return false;
+		}
+		return true;
+	}
+
+	private normalizeEnvelope(raw: unknown): Exclude<RealtimeEnvelope, 'envelopeId'> | null {
+		if (!raw || typeof raw !== 'object') return null;
+		const obj = raw as Record<string, unknown>;
+		const envelopeId = typeof obj.envelopeId === 'string' ? obj.envelopeId.trim() : '';
+		const type = typeof obj.type === 'string' ? obj.type.trim() : '';
+		const userId = typeof obj.userId === 'string' ? obj.userId.trim() : '';
+		const timestamp = typeof obj.timestamp === 'string' ? obj.timestamp.trim() : '';
+		if (Number.isNaN(Date.parse(timestamp))) return null;
+		return {
+			envelopeId,
+			type,
+			userId,
+			timestamp,
+			...(obj.payload !== undefined ? { payload: obj.payload } : {}),
+		};
+	}
+
+	private awaitAcks(envelopeId: string, sockets: WebSocket[]): Promise<unknown[]> {
+		if (sockets.length === 0) return Promise.resolve([]);
+		return new Promise((resolve) => {
+			const pending = new Set(sockets);
+			const entry = {
+				pending,
+				results: [] as unknown[],
+				resolve,
+				timeout: 0 as unknown as number,
+			};
+			entry.timeout = setTimeout(() => {
+				if (!this.pendingAcks.has(envelopeId)) return;
+				this.pendingAcks.delete(envelopeId);
+				resolve(entry.results);
+			}, ACK_TIMEOUT_MS) as unknown as number;
+			this.pendingAcks.set(envelopeId, entry);
+		});
+	}
+
+	private removeFromPending(envelopeId: string, socket: WebSocket): void {
+		const entry = this.pendingAcks.get(envelopeId);
+		if (!entry) return;
+		entry.pending.delete(socket);
+		if (entry.pending.size === 0) {
+			this.finishPending(envelopeId, entry);
+		}
+	}
+
+	private finishPending(
+		envelopeId: string,
+		entry: { pending: Set<WebSocket>; results: unknown[]; resolve: (results: unknown[]) => void; timeout: number }
+	) {
+		clearTimeout(entry.timeout);
+		this.pendingAcks.delete(envelopeId);
+		entry.resolve(entry.results);
+	}
+
+	private handleAck(ws: WebSocket, msg: AckMessage): void {
+		if (!msg.envelopeId || typeof msg.envelopeId !== 'string') return;
+		const entry = this.pendingAcks.get(msg.envelopeId);
+		if (!entry) return;
+		if (!entry.pending.delete(ws)) return;
+		entry.results.push('result' in msg ? msg.result : null);
+		if (entry.pending.size === 0) {
+			this.finishPending(msg.envelopeId, entry);
+		}
+	}
+
+	private handleSubscribe(ws: WebSocket, msg: SubscribeMessage): void {
+		const incoming = this.normalizeFilters(msg.filters);
+		if (incoming.length === 0) return;
+		const existing = this.subscriptions.get(ws) ?? [];
+		const merged = [...existing];
+		for (const filter of incoming) {
+			if (!merged.some((f) => this.filtersEqual(f, filter))) {
+				merged.push(filter);
+			}
+		}
+		this.subscriptions.set(ws, merged);
+	}
+
+	private handleUnsubscribe(ws: WebSocket, msg: UnsubscribeMessage): void {
+		const toRemove = this.normalizeFilters(msg.filters);
+		if (toRemove.length === 0) return;
+		const existing = this.subscriptions.get(ws) ?? [];
+		const remaining = existing.filter((f) => !toRemove.some((r) => this.filtersEqual(f, r)));
+		this.subscriptions.set(ws, remaining);
+	}
+
+	private normalizeFilters(raw: unknown): SubscriptionFilter[] {
+		if (!Array.isArray(raw)) return [];
+		const normalized: SubscriptionFilter[] = [];
+		for (const candidate of raw.slice(0, 50)) {
+			if (!candidate || typeof candidate !== 'object') continue;
+			const obj = candidate as Record<string, unknown>;
+			const type = typeof obj.type === 'string' ? obj.type.trim() : '';
+			if (!type) continue;
+			const filter: SubscriptionFilter = { type };
+			let valid = true;
+			for (const [key, value] of Object.entries(obj)) {
+				if (key === 'type') continue;
+				if (typeof value !== 'string') {
+					valid = false;
+					break;
+				}
+				filter[key] = value;
+			}
+			if (valid) normalized.push(filter);
+		}
+		return normalized;
+	}
+
+	private filtersEqual(a: SubscriptionFilter, b: SubscriptionFilter): boolean {
+		const keysA = Object.keys(a).sort();
+		const keysB = Object.keys(b).sort();
+		if (keysA.length !== keysB.length) return false;
+		for (let i = 0; i < keysA.length; i++) {
+			const key = keysA[i];
+			if (key !== keysB[i]) return false;
+			if (a[key] !== b[key]) return false;
+		}
+		return true;
 	}
 
 	private corsPreflight(): Response {
@@ -186,10 +408,16 @@ export default {
 		// WebSocket upgrade → authenticate here, then forward to the user's DO
 		if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
 			const auth = await authenticate(request.headers.get('Authorization'), env.JWT_SECRET, url.searchParams.get('token'));
-			if (!auth) return new Response('Unauthorized', { status: 401 });
+			if (!auth) {
+				console.warn('unauthorized websocket connection attempt');
+				return new Response('Unauthorized', { status: 401 });
+			}
 
 			const userId = auth.userId.trim();
-			if (!userId) return new Response('Unauthorized', { status: 401 });
+			if (!userId) {
+				console.warn('websocket connection attempt with empty userId in token');
+				return new Response('Unauthorized', { status: 401 });
+			}
 
 			const stub = stubForUser(env, userId);
 
@@ -201,7 +429,10 @@ export default {
 		// Process publish entirely here; send canonical envelope to the user's DO
 		if (method === 'POST' && url.pathname === '/publish') {
 			const auth = await authenticate(request.headers.get('Authorization'), env.JWT_SECRET, url.searchParams.get('token'));
-			if (!auth) return json({ error: 'Unauthorized' }, 401);
+			if (!auth) {
+				console.warn('unauthorized publish attempt');
+				return json({ error: 'Unauthorized' }, 401);
+			}
 
 			const contentType = request.headers.get('content-type') ?? '';
 			if (!contentType.toLowerCase().includes('application/json')) {
@@ -217,11 +448,11 @@ export default {
 
 			const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
 			if (!userId) return json({ error: 'userId is required' }, 400);
-			// if (auth.userId !== userId) return json({ error: 'Forbidden' }, 403);
 
 			const type = typeof body.type === 'string' && body.type.trim().length > 0 ? body.type.trim() : 'message';
 
 			const envelope: RealtimeEnvelope = {
+				envelopeId: generateEnvelopeId(),
 				type,
 				userId,
 				timestamp: new Date().toISOString(),
@@ -232,7 +463,7 @@ export default {
 
 			const deliverReq = new Request(new URL('/deliver', request.url), {
 				method: 'POST',
-				headers: { 'content-type': 'application/json' },
+				headers: { 'content-type': 'application/json', 'x-user-id': userId },
 				body: JSON.stringify(envelope),
 			});
 
@@ -287,6 +518,13 @@ function sanitizeQueryToken(token: string | null | undefined): string | null {
 	if (!token) return null;
 	const trimmed = token.trim();
 	return trimmed.length > 0 ? trimmed : null;
+}
+
+function generateEnvelopeId(): string {
+	if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+		return crypto.randomUUID();
+	}
+	return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 // Clone a Request, optionally change path, and add a header

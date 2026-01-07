@@ -39,13 +39,15 @@ For production, run `wrangler secret put JWT_SECRET` and ensure the Durable Obje
 ### WebSocket
 
 - **Endpoint:** `wss://<worker-domain>/`
-- **Headers:** `Authorization: Bearer <JWT>` (payload must include a `userId` string).
-- **Behavior:** After authentication the Worker forwards the upgrade to the user’s Durable Object. Sending `ping` (case-insensitive) returns `pong`; all other messages are currently ignored. Expect standard WebSocket close codes (abnormal closures are logged).
+- **Headers:** `Authorization: Bearer <JWT>` (payload must include a `userId` string). Browsers may also pass `?token=<JWT>` query param.
+- **Subscriptions:** After connect, clients must send `{"type":"subscribe","filters":[{ "type": "chat_message", "questId": "q1", "nodeId": "n1" }]}`. Filters match exactly on provided keys against the envelope: `type` compares to the envelope `type`, other keys compare to fields inside the JSON `payload`. Add filters with `subscribe`, remove with `{"type":"unsubscribe","filters":[...]}`.
+- **Acks:** For each delivered envelope, clients should respond with `{"type":"ack","envelopeId":"<id>","result":<any>}`. Results are returned to the `/publish` caller.
+- **Behavior:** Server replies `pong` to `ping` (case-insensitive). Only sockets with at least one matching filter receive a message.
 
 ### Publish
 
 - **Endpoint:** `POST https://<worker-domain>/publish`
-- **Headers:** `Authorization: Bearer <JWT>`, `Content-Type: application/json`
+- **Headers:** `Authorization: Bearer <JWT>` (or `?token=<JWT>` query param), `Content-Type: application/json`
 - **Body:**
 
 ```json
@@ -56,13 +58,15 @@ For production, run `wrangler secret put JWT_SECRET` and ensure the Durable Obje
 }
 ```
 
-- **Rules:** `userId` must match the authenticated token’s `userId`. Requests without JSON bodies or mismatched users receive error responses.
-- **Response:** `{"delivered": <count>, "attempted": <connections>}` indicating fan-out results from the Durable Object.
+- **Rules:** Multi-tenant publish is allowed; `userId` in the body is the delivery target. `envelopeId` is generated for you; you don’t need to supply one. Requests without JSON bodies receive error responses.
+- **Response:** `{"clientCount": <delivered-to>, "results": [<ack results>...]}`. The worker waits up to 5s for client acknowledgments and returns whatever arrived; `clientCount` reflects sockets that matched at least one subscription filter.
 - **CORS:** `OPTIONS /publish` is preflight-enabled with `*` origin for browser usage.
+- **Ack behavior:** Each delivered envelope should be acked with `{"type":"ack","envelopeId":"<id>","result":<any>}`. If `result` is omitted, the server records `null` for that client in the returned `results` array.
+- **Subscription rules:** Filters are exact-match and must be objects with string values (including `type`). Up to 50 filters are processed per subscribe/unsubscribe message.
 
 ## JWT Expectations
 
-Tokens are verified with HS256/HS512 (any JWT supported by `jose`) using `JWT_SECRET`. The payload must include a non-empty `userId` string. Other claims are passed through untouched and can be extended later.
+Tokens are verified with HS256 using `JWT_SECRET`. The payload must include a non-empty `userId` string. Other claims are passed through untouched and can be extended later.
 
 ## Deployment Notes
 
@@ -75,4 +79,3 @@ Tokens are verified with HS256/HS512 (any JWT supported by `jose`) using `JWT_SE
 - **Unauthorized (401):** Check that the Authorization header is present and the token contains `userId`.
 - **Unsupported Media Type (415):** Ensure `Content-Type: application/json` on `/publish`.
 - **Delivery count < active clients:** The Durable Object logs errors when sockets fail; inspect Cloudflare tail logs (`wrangler tail`) for per-user traces.
-
